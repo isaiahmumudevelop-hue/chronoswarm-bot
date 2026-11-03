@@ -1,0 +1,5 @@
+.env
+chronoswarm.db
+__pycache__/
+*.pyc
+chronoswarm-env-313/

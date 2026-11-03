@@ -4,3 +4,5 @@ python-dotenv==1.0.1
 aiohttp
 edge-tts
 beautifulsoup4
+yt-dlp
+static-ffmpeg

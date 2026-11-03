@@ -5,9 +5,11 @@ import sqlite3
 import aiohttp
 import edge_tts
 import base64
+import glob
 from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
 from urllib.parse import quote_plus
+import yt_dlp
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -24,14 +26,12 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 DB_PATH = "chronoswarm.db"
-AGENT_TTL_MINUTES = 30
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone="UTC")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- IN-MEMORY STATE CACHE ---
 user_states = {}
 
 # ==========================================
@@ -44,9 +44,11 @@ def get_main_keyboard():
         [KeyboardButton(text="📍 Share Location"), KeyboardButton(text="🔍 Find Place")],
         [KeyboardButton(text="🌤️ Weather"), KeyboardButton(text="🌐 Web Search")],
         [KeyboardButton(text="🎨 Gen Image"), KeyboardButton(text="👁️ Analyze Image")],
-        [KeyboardButton(text="💬 Send Message"), KeyboardButton(text="📇 My Contacts")],
-        [KeyboardButton(text="👥 Add Contact"), KeyboardButton(text="⏰ Schedule Relay")],
-        [KeyboardButton(text="🗣️ Voice Settings"), KeyboardButton(text="🆔 My Chat ID")]
+        [KeyboardButton(text="🎬 Analyze Video"), KeyboardButton(text="📥 Download Video")],
+        [KeyboardButton(text="🎵 Download Music"), KeyboardButton(text="💬 Send Message")],
+        [KeyboardButton(text="📇 My Contacts"), KeyboardButton(text="👥 Add Contact")],
+        [KeyboardButton(text="⏰ Schedule Relay"), KeyboardButton(text="🗣️ Voice Settings")],
+        [KeyboardButton(text="🆔 My Chat ID")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
@@ -62,7 +64,6 @@ def init_db():
     c.execute("CREATE TABLE IF NOT EXISTS user_locations (chat_id INTEGER PRIMARY KEY, lat REAL, lon REAL)")
     c.execute("CREATE TABLE IF NOT EXISTS contacts (owner_id INTEGER, contact_id INTEGER, name TEXT, UNIQUE(owner_id, contact_id))")
     c.execute("CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY, is_verified BOOLEAN DEFAULT 0, last_contact INTEGER, last_active TEXT, voice_persona TEXT DEFAULT 'en-US-AriaNeural')")
-    
     try:
         c.execute("ALTER TABLE users ADD COLUMN voice_persona TEXT DEFAULT 'en-US-AriaNeural'")
     except sqlite3.OperationalError:
@@ -134,7 +135,7 @@ async def ask_ai(prompt: str) -> str:
     }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload) as resp:
+            async with session.post(url, headers=headers, json=payload, timeout=30) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     return data['choices'][0]['message']['content']
@@ -142,7 +143,6 @@ async def ask_ai(prompt: str) -> str:
     except Exception as e: return f"AI failed: {str(e)}"
 
 async def analyze_image(file_path: str, prompt: str) -> str:
-    """FIX: Uses the new llama-4-scout model for vision tasks"""
     with open(file_path, "rb") as f:
         base64_image = base64.b64encode(f.read()).decode('utf-8')
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -154,7 +154,7 @@ async def analyze_image(file_path: str, prompt: str) -> str:
     }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload) as resp:
+            async with session.post(url, headers=headers, json=payload, timeout=45) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     return data['choices'][0]['message']['content']
@@ -165,16 +165,17 @@ async def transcribe_audio(file_path: str) -> str:
     url = "https://api.groq.com/openai/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     data = aiohttp.FormData()
-    with open(file_path, 'rb') as f:
-        data.add_field('file', f, filename='audio.ogg', content_type='audio/ogg')
-    data.add_field('model', 'whisper-large-v3')
     try:
+        with open(file_path, 'rb') as f:
+            data.add_field('file', f, filename=os.path.basename(file_path), content_type='audio/mpeg')
+        data.add_field('model', 'whisper-large-v3')
+        
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, data=data) as resp:
+            async with session.post(url, headers=headers, data=data, timeout=60) as resp:
                 if resp.status == 200:
                     result = await resp.json()
                     return result.get('text', '')
-                return "Error transcribing audio."
+                return f"Error transcribing audio. Status: {resp.status}"
     except Exception as e: return f"STT failed: {str(e)}"
 
 async def generate_voice(text: str, voice: str = "en-US-AriaNeural") -> str:
@@ -183,13 +184,15 @@ async def generate_voice(text: str, voice: str = "en-US-AriaNeural") -> str:
         communicate = edge_tts.Communicate(text, voice)
         await communicate.save(filename)
         return filename
-    except Exception as e: return None
+    except Exception as e: 
+        logging.error(f"TTS Error: {e}")
+        return None
 
 async def get_weather(lat: float, lon: float) -> str:
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&timezone=auto"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
+            async with session.get(url, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     cw = data.get("current_weather", {})
@@ -207,7 +210,7 @@ async def search_places(query: str, lat: float = None, lon: float = None) -> str
         url += f"&viewbox={lon-delta},{lat+delta},{lon+delta},{lat-delta}&bounded=1"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as resp:
+            async with session.get(url, headers=headers, timeout=15) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if not data: return "❌ No places found."
@@ -216,19 +219,6 @@ async def search_places(query: str, lat: float = None, lon: float = None) -> str
                     return "\n\n".join(res)
     except: pass
     return "❌ Search error."
-
-async def get_route(lat1: float, lon1: float, lat2: float, lon2: float) -> str:
-    url = f"https://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}?overview=false"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("code") == "Ok":
-                        r = data["routes"][0]
-                        return f"🚗 **Route:** {r['distance']/1000:.1f} km, {int(r['duration']/60)} mins."
-    except: pass
-    return "❌ Route error."
 
 # ==========================================
 # 4. HANDLERS
@@ -239,7 +229,7 @@ async def start_handler(message: Message):
     update_last_active(chat_id)
     user = db_fetch("SELECT is_verified FROM users WHERE chat_id = ?", (chat_id,))
     if user and user[0] == 1:
-        await message.answer("🤖 **ChronoSwarm v6.1**\nWelcome back!", reply_markup=get_main_keyboard())
+        await message.answer("🤖 **ChronoSwarm v7.0**\nWelcome back! DIY Media Engine active.", reply_markup=get_main_keyboard())
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ I am a Human", callback_data="verify_human")]])
         await message.answer("🛡️ **Security Check**\nPlease verify you are human.", reply_markup=kb)
@@ -284,7 +274,7 @@ async def photo_handler(message: Message):
     await message.answer("👁️ Analyzing image...")
     prompt = message.caption if message.caption else "What is in this image?"
     result = await analyze_image(file_path, prompt)
-    os.remove(file_path)
+    if os.path.exists(file_path): os.remove(file_path)
     await message.answer(result, reply_markup=get_main_keyboard())
 
 @dp.message(F.voice)
@@ -294,9 +284,9 @@ async def voice_handler(message: Message):
     await bot.download(message.voice, destination=file_path)
     await message.answer("🎙️ Transcribing...")
     text = await transcribe_audio(file_path)
-    os.remove(file_path)
+    if os.path.exists(file_path): os.remove(file_path)
     
-    if text.startswith("Error"): 
+    if text.startswith("Error") or text.startswith("STT"):
         await message.answer(text)
         return
         
@@ -312,8 +302,68 @@ async def voice_handler(message: Message):
     elif state == "gen_image":
         user_states.pop(message.chat.id, None)
         await process_gen_image(message, text)
+    elif state == "dl_music":
+        user_states.pop(message.chat.id, None)
+        await process_download_music(message, text)
+    elif state == "dl_video":
+        user_states.pop(message.chat.id, None)
+        await process_download_video(message, text)
     else:
         await process_new_task(message, text)
+
+@dp.message(F.video)
+async def video_handler(message: Message):
+    update_last_active(message.chat.id)
+    
+    if message.video.file_size and message.video.file_size > 20 * 1024 * 1024:
+        await message.answer("❌ Video is too large! Telegram limits bots to downloading 20MB files directly.", reply_markup=get_main_keyboard())
+        return
+
+    file_path = f"vid_{message.chat.id}.mp4"
+    audio_path = f"aud_{message.chat.id}.mp3"
+    
+    await message.answer("🎬 Downloading video...")
+    try:
+        await bot.download(message.video, destination=file_path)
+    except Exception as e:
+        await message.answer(f"❌ Failed to download video: {e}", reply_markup=get_main_keyboard())
+        return
+    
+    await message.answer("🎵 Extracting audio and transcribing (this may take a moment)...")
+    
+    try:
+        process = await asyncio.create_subprocess_exec(
+            'ffmpeg', '-i', file_path, '-vn', '-acodec', 'libmp3lame', '-q:a', '4', audio_path, '-y',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await process.communicate()
+
+        if not os.path.exists(audio_path):
+            await message.answer("❌ Failed to extract audio. Is ffmpeg installed?")
+            return
+
+        if os.path.getsize(audio_path) > 24 * 1024 * 1024:
+            await message.answer("❌ Audio track is too large for AI transcription (over 24MB). Try a shorter video.")
+            return
+
+        transcript = await transcribe_audio(audio_path)
+        if transcript.startswith("Error") or transcript.startswith("STT"):
+            await message.answer(f"❌ Transcription failed: {transcript}")
+            return
+
+        await message.answer("🧠 Audio transcribed! Generating summary...")
+        prompt = f"Here is the transcript of a video: '{transcript}'. Please provide a concise summary of what happens in this video."
+        summary = await ask_ai(prompt)
+
+        response_text = f"**📝 Transcript (First 500 chars):**\n_{transcript[:500]}..._\n\n**🧠 AI Summary:**\n{summary}"
+        await message.answer(response_text, reply_markup=get_main_keyboard())
+
+    except Exception as e:
+        await message.answer(f"❌ Video processing failed: {e}", reply_markup=get_main_keyboard())
+    finally:
+        if os.path.exists(file_path): os.remove(file_path)
+        if os.path.exists(audio_path): os.remove(audio_path)
 
 @dp.message(F.text)
 async def text_router(message: Message):
@@ -348,6 +398,17 @@ async def text_router(message: Message):
     elif text == "🎨 Gen Image":
         user_states[chat_id] = "gen_image"
         await message.answer("🎨 Describe the image:")
+        return
+    elif text == "🎬 Analyze Video":
+        await message.answer("🎬 Please send/forward a short video file (under 20MB) for me to analyze.")
+        return
+    elif text == "📥 Download Video":
+        user_states[chat_id] = "dl_video"
+        await message.answer("📥 Send me a link to a YouTube, TikTok, or Instagram video:")
+        return
+    elif text == "🎵 Download Music":
+        user_states[chat_id] = "dl_music"
+        await message.answer("🎵 Send me a song name or a YouTube link:")
         return
     elif text == "🗣️ Voice Settings":
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -417,6 +478,12 @@ async def text_router(message: Message):
     elif state == "gen_image":
         user_states.pop(chat_id, None)
         await process_gen_image(message, text)
+    elif state == "dl_video":
+        user_states.pop(chat_id, None)
+        await process_download_video(message, text)
+    elif state == "dl_music":
+        user_states.pop(chat_id, None)
+        await process_download_music(message, text)
     elif state == "add_contact":
         user_states.pop(chat_id, None)
         parts = text.split(maxsplit=1)
@@ -466,41 +533,31 @@ async def process_web_search(message: Message, query: str):
     await message.answer("🌐 Searching the web...", reply_markup=get_main_keyboard())
     try:
         url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as resp:
+            async with session.get(url, headers=headers, timeout=15) as resp:
                 if resp.status != 200:
-                    await message.answer("❌ Search failed. Please try again later.", reply_markup=get_main_keyboard())
+                    await message.answer("❌ Search failed. Try again.", reply_markup=get_main_keyboard())
                     return
-                
                 html = await resp.text()
                 soup = BeautifulSoup(html, "html.parser")
-                
                 results = []
                 for result in soup.find_all("div", class_="result")[:3]:
                     title_tag = result.find("a", class_="result__a")
                     snippet_tag = result.find("a", class_="result__snippet")
                     if title_tag:
-                        title = title_tag.get_text()
-                        href = title_tag.get("href")
-                        snippet = snippet_tag.get_text() if snippet_tag else "No description available."
-                        results.append(f"• **{title}**\n{snippet}\n[Read More]({href})\n")
-                        
+                        results.append(f"• **{title_tag.get_text()}**\n{snippet_tag.get_text() if snippet_tag else ''}\n[Read More]({title_tag.get('href')})\n")
                 if not results:
                     await message.answer("❌ No results found.", reply_markup=get_main_keyboard())
                 else:
                     await message.answer("🌐 **Search Results:**\n\n" + "\n".join(results), disable_web_page_preview=True, reply_markup=get_main_keyboard())
-                    
     except Exception as e:
         await message.answer(f"❌ Search error: {e}", reply_markup=get_main_keyboard())
 
 async def process_gen_image(message: Message, prompt: str):
-    """FIX: Adds retry logic and fallback to lower resolution"""
     await message.answer("🎨 Generating image...", reply_markup=get_main_keyboard())
-    
-    # Try up to 3 times with decreasing resolution
-    resolutions = [(1024, 1024), (768, 768), (512, 512)]
+    resolutions = [(1024, 1024), (768, 768)]
     
     for attempt, (width, height) in enumerate(resolutions):
         url = f"https://image.pollinations.ai/prompt/{prompt.replace(' ', '%20')}?width={width}&height={height}&nologo=true"
@@ -509,27 +566,77 @@ async def process_gen_image(message: Message, prompt: str):
                 async with session.get(url, timeout=30) as resp:
                     if resp.status == 200:
                         img_bytes = await resp.read()
-                        await message.answer_photo(
-                            BufferedInputFile(img_bytes, filename="image.jpg"), 
-                            caption=f"🎨 {prompt}", 
-                            reply_markup=get_main_keyboard()
-                        )
-                        return  # Success, exit function
-                    else:
-                        logging.warning(f"Image gen attempt {attempt+1} failed with status {resp.status}")
+                        await message.answer_photo(BufferedInputFile(img_bytes, filename="image.jpg"), caption=f"🎨 {prompt}", reply_markup=get_main_keyboard())
+                        return
         except Exception as e:
             logging.warning(f"Image gen attempt {attempt+1} error: {e}")
-        
-        # Wait a bit before retrying (except after the last attempt)
-        if attempt < len(resolutions) - 1:
-            await asyncio.sleep(2)
+        if attempt < len(resolutions) - 1: await asyncio.sleep(2)
+            
+    await message.answer("❌ Image generation failed (server overloaded). Try a simpler prompt.", reply_markup=get_main_keyboard())
+
+async def process_download_video(message: Message, url: str):
+    await message.answer("📥 Downloading video... Please wait.", reply_markup=get_main_keyboard())
+    outtmpl = f"dl_{message.chat.id}_%(id)s.%(ext)s"
     
-    # All attempts failed
-    await message.answer(
-        "❌ Image generation failed after multiple attempts. "
-        "The service might be temporarily overloaded. Please try again later or with a simpler prompt.",
-        reply_markup=get_main_keyboard()
-    )
+    ydl_opts = {
+        'format': 'best[ext=mp4]/best',
+        'outtmpl': outtmpl,
+        'quiet': True,
+        'noplaylist': True,
+    }
+    
+    def download():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=True)
+
+    try:
+        info = await asyncio.to_thread(download)
+        filename = info['requested_downloads'][0]['filepath']
+        
+        if os.path.getsize(filename) > 50 * 1024 * 1024:
+            await message.answer("❌ Video is too large to send via Telegram (Limit is 50MB).", reply_markup=get_main_keyboard())
+        else:
+            await message.answer_video(FSInputFile(filename), caption="📥 Here is your video!", reply_markup=get_main_keyboard())
+    except Exception as e:
+        await message.answer(f"❌ Download failed. Make sure the URL is valid and public.\nError: {str(e)[:100]}", reply_markup=get_main_keyboard())
+    finally:
+        for f in glob.glob(f"dl_{message.chat.id}_*"):
+            try: os.remove(f)
+            except: pass
+
+async def process_download_music(message: Message, query: str):
+    await message.answer("🎵 Searching and downloading music...", reply_markup=get_main_keyboard())
+    outtmpl = f"mus_{message.chat.id}_%(id)s.%(ext)s"
+    
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': outtmpl,
+        'quiet': True,
+        'noplaylist': True,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
+    }
+    
+    def download():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            search_q = query if query.startswith("http") else f"ytsearch1:{query}"
+            return ydl.extract_info(search_q, download=True)
+
+    try:
+        info = await asyncio.to_thread(download)
+        base_name = info['requested_downloads'][0]['filepath'].rsplit('.', 1)[0]
+        filename = f"{base_name}.mp3"
+        
+        await message.answer_audio(FSInputFile(filename), title=info.get('title', query), reply_markup=get_main_keyboard())
+    except Exception as e:
+        await message.answer(f"❌ Music download failed: {str(e)[:100]}", reply_markup=get_main_keyboard())
+    finally:
+        for f in glob.glob(f"mus_{message.chat.id}_*"):
+            try: os.remove(f)
+            except: pass
 
 async def process_done(message: Message):
     row = db_fetch("SELECT id, goal FROM tasks WHERE chat_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1", (message.chat.id,))
@@ -552,6 +659,19 @@ async def process_done(message: Message):
         os.remove(voice_file)
 
 # ==========================================
+# GLOBAL ERROR HANDLER
+# ==========================================
+@dp.errors()
+async def error_handler(event: any):
+    try:
+        update = event.update
+        logging.error(f"Exception while handling update: {update}")
+        if update.message:
+            await update.message.answer("⚠️ An unexpected error occurred. Please try again.")
+    except Exception as e:
+        logging.error(f"Failed to handle error: {e}")
+
+# ==========================================
 # 6. MAIN
 # ==========================================
 async def main():
@@ -569,6 +689,7 @@ async def main():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    logging.info(f"ChronoSwarm is running on port {port}")
     
     await bot_task
 
