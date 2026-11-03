@@ -148,7 +148,7 @@ async def analyze_image(file_path: str, prompt: str) -> str:
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     payload = {
-        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+        "model": "llama-3.2-11b-vision-preview", # FIXED MODEL
         "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}]}],
         "max_tokens": 500
     }
@@ -166,8 +166,11 @@ async def transcribe_audio(file_path: str) -> str:
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     data = aiohttp.FormData()
     try:
+        # FIXED: Read file into memory first
         with open(file_path, 'rb') as f:
-            data.add_field('file', f, filename=os.path.basename(file_path), content_type='audio/mpeg')
+            file_bytes = f.read()
+            
+        data.add_field('file', file_bytes, filename=os.path.basename(file_path), content_type='audio/mpeg')
         data.add_field('model', 'whisper-large-v3')
         
         async with aiohttp.ClientSession() as session:
@@ -229,7 +232,7 @@ async def start_handler(message: Message):
     update_last_active(chat_id)
     user = db_fetch("SELECT is_verified FROM users WHERE chat_id = ?", (chat_id,))
     if user and user[0] == 1:
-        await message.answer("🤖 **ChronoSwarm v7.0**\nWelcome back! DIY Media Engine active.", reply_markup=get_main_keyboard())
+        await message.answer("🤖 **ChronoSwarm v7.1**\nWelcome back! Media Engine active.", reply_markup=get_main_keyboard())
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ I am a Human", callback_data="verify_human")]])
         await message.answer("🛡️ **Security Check**\nPlease verify you are human.", reply_markup=kb)
@@ -513,7 +516,8 @@ async def text_router(message: Message):
             await message.answer(f"✅ Scheduled for {time_str} UTC.", reply_markup=get_main_keyboard())
         except: await message.answer("❌ Format: `12345678 14:30 Message`", reply_markup=get_main_keyboard())
     else:
-        await message.answer("Please use the menu buttons.", reply_markup=get_main_keyboard())
+        # THIS IS THE FIX FOR TYPING WITHOUT PRESSING NEW TASK
+        await process_new_task(message, text)
 
 # ==========================================
 # 5. PROCESSES
@@ -583,6 +587,7 @@ async def process_download_video(message: Message, url: str):
         'outtmpl': outtmpl,
         'quiet': True,
         'noplaylist': True,
+        'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'mweb']}},
     }
     
     def download():
@@ -613,6 +618,7 @@ async def process_download_music(message: Message, query: str):
         'outtmpl': outtmpl,
         'quiet': True,
         'noplaylist': True,
+        'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'mweb']}},
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
