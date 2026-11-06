@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
 from urllib.parse import quote_plus
 import yt_dlp
+from pypdf import PdfReader
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -44,11 +45,11 @@ def get_main_keyboard():
         [KeyboardButton(text="📍 Share Location"), KeyboardButton(text="🔍 Find Place")],
         [KeyboardButton(text="🌤️ Weather"), KeyboardButton(text="🌐 Web Search")],
         [KeyboardButton(text="🎨 Gen Image"), KeyboardButton(text="👁️ Analyze Image")],
-        [KeyboardButton(text="🎬 Analyze Video"), KeyboardButton(text="📥 Download Video")],
-        [KeyboardButton(text="🎵 Download Music"), KeyboardButton(text="💬 Send Message")],
-        [KeyboardButton(text="📇 My Contacts"), KeyboardButton(text="👥 Add Contact")],
-        [KeyboardButton(text="🚀 Promote Content"), KeyboardButton(text="🗣️ Voice Settings")],
-        [KeyboardButton(text="🆔 My Chat ID")]
+        [KeyboardButton(text="🎬 Analyze Video"), KeyboardButton(text="📄 Analyze PDF")],
+        [KeyboardButton(text="📥 Download Video"), KeyboardButton(text="🎵 Download Music")],
+        [KeyboardButton(text="💬 Send Message"), KeyboardButton(text="📇 My Contacts")],
+        [KeyboardButton(text="👥 Add Contact"), KeyboardButton(text="🚀 Promote Content")],
+        [KeyboardButton(text="🗣️ Voice Settings"), KeyboardButton(text="🆔 My Chat ID")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
@@ -66,7 +67,6 @@ def init_db():
     c.execute("CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY, is_verified BOOLEAN DEFAULT 0, last_contact INTEGER, last_active TEXT, voice_persona TEXT DEFAULT 'en-US-AriaNeural', referred_by INTEGER)")
     c.execute("CREATE TABLE IF NOT EXISTS promos (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, media_type TEXT, file_id TEXT, caption TEXT, link TEXT, views INTEGER DEFAULT 0, created_at TEXT)")
     
-    # Add columns if upgrading from older version
     try: c.execute("ALTER TABLE users ADD COLUMN voice_persona TEXT DEFAULT 'en-US-AriaNeural'")
     except sqlite3.OperationalError: pass
     try: c.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
@@ -250,7 +250,7 @@ async def start_handler(message: Message):
         bot_info = await bot.get_me()
         ref_link = f"https://t.me/{bot_info.username}?start=ref_{chat_id}"
         await message.answer(
-            f"🤖 **ChronoSwarm v8.0**\nWelcome back!\n\n"
+            f"🤖 **ChronoSwarm v9.0**\nWelcome back!\n\n"
             f"🔗 **Your Invite Link:**\n`{ref_link}`\n"
             f"Share this to grow the network!", 
             reply_markup=get_main_keyboard()
@@ -291,12 +291,45 @@ async def location_handler(message: Message):
     db_execute("INSERT OR REPLACE INTO user_locations (chat_id, lat, lon) VALUES (?, ?, ?)", (message.chat.id, lat, lon))
     await message.answer(f"📍 Location Saved!", reply_markup=get_main_keyboard())
 
+@dp.message(F.document)
+async def document_handler(message: Message):
+    chat_id = message.chat.id
+    update_last_active(chat_id)
+    
+    if not message.document.file_name.lower().endswith('.pdf'):
+        await message.answer("❌ Please send a PDF file.", reply_markup=get_main_keyboard())
+        return
+
+    file_path = f"doc_{chat_id}.pdf"
+    await message.answer("📄 Downloading and reading PDF...")
+    try:
+        await bot.download(message.document, destination=file_path)
+        
+        reader = PdfReader(file_path)
+        text = ""
+        for page in reader.pages[:10]:
+            text += page.extract_text() or ""
+
+        if not text.strip():
+            await message.answer("❌ Could not extract text from this PDF. It might be a scanned image or empty.", reply_markup=get_main_keyboard())
+            return
+
+        await message.answer("🧠 Analyzing document with AI (this may take a moment)...")
+        prompt = f"Here is the text from a PDF document:\n\n{text[:10000]}\n\nPlease summarize this document and highlight the key points."
+        summary = await ask_ai(prompt)
+        await message.answer(f"📄 **PDF Analysis:**\n\n{summary}", reply_markup=get_main_keyboard())
+        
+    except Exception as e:
+        await message.answer(f"❌ Error reading PDF: {str(e)[:100]}", reply_markup=get_main_keyboard())
+    finally:
+        if os.path.exists(file_path): 
+            os.remove(file_path)
+
 @dp.message(F.photo)
 async def photo_handler(message: Message):
     chat_id = message.chat.id
     update_last_active(chat_id)
     
-    # Check if user is in Promo Mode
     if user_states.get(chat_id) == "promo_link":
         user_states.pop(chat_id, None)
         caption = message.caption or "Check this out!"
@@ -307,7 +340,6 @@ async def photo_handler(message: Message):
         await broadcast_promo(message, "photo", file_id, caption)
         return
 
-    # Normal Vision Analysis
     file_path = f"temp_{chat_id}.jpg"
     await bot.download(message.photo[-1], destination=file_path)
     await message.answer("👁️ Analyzing image...")
@@ -321,7 +353,6 @@ async def video_handler(message: Message):
     chat_id = message.chat.id
     update_last_active(chat_id)
 
-    # Check if user is in Promo Mode
     if user_states.get(chat_id) == "promo_link":
         user_states.pop(chat_id, None)
         if message.video.file_size and message.video.file_size > 20 * 1024 * 1024:
@@ -335,7 +366,6 @@ async def video_handler(message: Message):
         await broadcast_promo(message, "video", file_id, caption)
         return
 
-    # Normal Video Analysis
     if message.video.file_size and message.video.file_size > 20 * 1024 * 1024:
         await message.answer("❌ Video is too large! Telegram limits bots to downloading 20MB files directly.", reply_markup=get_main_keyboard())
         return
@@ -451,6 +481,8 @@ async def text_router(message: Message):
         await message.answer("🎨 Describe the image:")
     elif text == "🎬 Analyze Video":
         await message.answer("🎬 Please send/forward a short video file (under 20MB) for me to analyze.")
+    elif text == "📄 Analyze PDF":
+        await message.answer("📄 Please send me a PDF document to analyze.")
     elif text == "📥 Download Video":
         user_states[chat_id] = "dl_video"
         await message.answer("📥 Send me a link to a YouTube, TikTok, or Instagram video:")
@@ -559,7 +591,6 @@ async def text_router(message: Message):
             await message.answer(f"✅ Scheduled for {time_str} UTC.", reply_markup=get_main_keyboard())
         except: await message.answer("❌ Format: `12345678 14:30 Message`", reply_markup=get_main_keyboard())
     else:
-        # Fallback: treat any unknown text as a New Task
         await process_new_task(message, text)
 
 # ==========================================
@@ -580,7 +611,7 @@ async def broadcast_promo(message: Message, media_type: str, file_id: str, capti
             else:
                 await bot.send_message(uid, f"{promo_msg}\n{file_id}", disable_web_page_preview=False)
             count += 1
-            await asyncio.sleep(0.05) # Prevent Telegram rate limits
+            await asyncio.sleep(0.05) 
         except: pass 
         
     await message.answer(f"📢 **Promotion Complete!** Your content was broadcasted to {count} users.")

@@ -6,3 +6,4 @@ edge-tts
 beautifulsoup4
 yt-dlp
 static-ffmpeg
+pypdf
