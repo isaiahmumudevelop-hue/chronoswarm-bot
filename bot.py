@@ -47,7 +47,7 @@ def get_main_keyboard():
         [KeyboardButton(text="🎬 Analyze Video"), KeyboardButton(text="📥 Download Video")],
         [KeyboardButton(text="🎵 Download Music"), KeyboardButton(text="💬 Send Message")],
         [KeyboardButton(text="📇 My Contacts"), KeyboardButton(text="👥 Add Contact")],
-        [KeyboardButton(text="⏰ Schedule Relay"), KeyboardButton(text="🗣️ Voice Settings")],
+        [KeyboardButton(text="🚀 Promote Content"), KeyboardButton(text="🗣️ Voice Settings")],
         [KeyboardButton(text="🆔 My Chat ID")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -63,11 +63,15 @@ def init_db():
     c.execute("CREATE TABLE IF NOT EXISTS relays (id INTEGER PRIMARY KEY AUTOINCREMENT, target_chat_id INTEGER, message TEXT, send_at TEXT, sent BOOLEAN DEFAULT 0)")
     c.execute("CREATE TABLE IF NOT EXISTS user_locations (chat_id INTEGER PRIMARY KEY, lat REAL, lon REAL)")
     c.execute("CREATE TABLE IF NOT EXISTS contacts (owner_id INTEGER, contact_id INTEGER, name TEXT, UNIQUE(owner_id, contact_id))")
-    c.execute("CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY, is_verified BOOLEAN DEFAULT 0, last_contact INTEGER, last_active TEXT, voice_persona TEXT DEFAULT 'en-US-AriaNeural')")
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN voice_persona TEXT DEFAULT 'en-US-AriaNeural'")
-    except sqlite3.OperationalError:
-        pass
+    c.execute("CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY, is_verified BOOLEAN DEFAULT 0, last_contact INTEGER, last_active TEXT, voice_persona TEXT DEFAULT 'en-US-AriaNeural', referred_by INTEGER)")
+    c.execute("CREATE TABLE IF NOT EXISTS promos (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, media_type TEXT, file_id TEXT, caption TEXT, link TEXT, views INTEGER DEFAULT 0, created_at TEXT)")
+    
+    # Add columns if upgrading from older version
+    try: c.execute("ALTER TABLE users ADD COLUMN voice_persona TEXT DEFAULT 'en-US-AriaNeural'")
+    except sqlite3.OperationalError: pass
+    try: c.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
+    except sqlite3.OperationalError: pass
+        
     conn.commit()
     conn.close()
 
@@ -123,7 +127,7 @@ async def check_scheduled_relays():
     conn.close()
 
 # ==========================================
-# 3. HELPER FUNCTIONS
+# 3. HELPER FUNCTIONS (AI, Voice, Maps)
 # ==========================================
 async def ask_ai(prompt: str) -> str:
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -148,7 +152,7 @@ async def analyze_image(file_path: str, prompt: str) -> str:
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     payload = {
-        "model": "llama-3.2-11b-vision-preview", # FIXED MODEL
+        "model": "llama-3.2-11b-vision-preview",
         "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}]}],
         "max_tokens": 500
     }
@@ -166,10 +170,8 @@ async def transcribe_audio(file_path: str) -> str:
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     data = aiohttp.FormData()
     try:
-        # FIXED: Read file into memory first
         with open(file_path, 'rb') as f:
             file_bytes = f.read()
-            
         data.add_field('file', file_bytes, filename=os.path.basename(file_path), content_type='audio/mpeg')
         data.add_field('model', 'whisper-large-v3')
         
@@ -230,9 +232,29 @@ async def search_places(query: str, lat: float = None, lon: float = None) -> str
 async def start_handler(message: Message):
     chat_id = message.chat.id
     update_last_active(chat_id)
+    
+    # REFERRAL TRACKING
+    args = message.text.split()
+    if len(args) > 1 and args[1].startswith("ref_"):
+        referrer_id = int(args[1].replace("ref_", ""))
+        if referrer_id != chat_id:
+            user = db_fetch("SELECT referred_by FROM users WHERE chat_id = ?", (chat_id,))
+            if user and user[0] is None:
+                db_execute("UPDATE users SET referred_by = ? WHERE chat_id = ?", (referrer_id, chat_id))
+                try:
+                    await bot.send_message(referrer_id, "🎉 **New Referral!** Someone just joined using your link. Keep sharing!")
+                except: pass
+
     user = db_fetch("SELECT is_verified FROM users WHERE chat_id = ?", (chat_id,))
     if user and user[0] == 1:
-        await message.answer("🤖 **ChronoSwarm v7.1**\nWelcome back! Media Engine active.", reply_markup=get_main_keyboard())
+        bot_info = await bot.get_me()
+        ref_link = f"https://t.me/{bot_info.username}?start=ref_{chat_id}"
+        await message.answer(
+            f"🤖 **ChronoSwarm v8.0**\nWelcome back!\n\n"
+            f"🔗 **Your Invite Link:**\n`{ref_link}`\n"
+            f"Share this to grow the network!", 
+            reply_markup=get_main_keyboard()
+        )
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ I am a Human", callback_data="verify_human")]])
         await message.answer("🛡️ **Security Check**\nPlease verify you are human.", reply_markup=kb)
@@ -271,8 +293,22 @@ async def location_handler(message: Message):
 
 @dp.message(F.photo)
 async def photo_handler(message: Message):
-    update_last_active(message.chat.id)
-    file_path = f"temp_{message.chat.id}.jpg"
+    chat_id = message.chat.id
+    update_last_active(chat_id)
+    
+    # Check if user is in Promo Mode
+    if user_states.get(chat_id) == "promo_link":
+        user_states.pop(chat_id, None)
+        caption = message.caption or "Check this out!"
+        file_id = message.photo[-1].file_id
+        db_execute("INSERT INTO promos (user_id, media_type, file_id, caption, created_at) VALUES (?, ?, ?, ?, ?)", 
+                   (chat_id, "photo", file_id, caption, datetime.now(timezone.utc).isoformat()))
+        await message.answer("✅ **Content received!** Broadcasting to the network now...", reply_markup=get_main_keyboard())
+        await broadcast_promo(message, "photo", file_id, caption)
+        return
+
+    # Normal Vision Analysis
+    file_path = f"temp_{chat_id}.jpg"
     await bot.download(message.photo[-1], destination=file_path)
     await message.answer("👁️ Analyzing image...")
     prompt = message.caption if message.caption else "What is in this image?"
@@ -280,50 +316,32 @@ async def photo_handler(message: Message):
     if os.path.exists(file_path): os.remove(file_path)
     await message.answer(result, reply_markup=get_main_keyboard())
 
-@dp.message(F.voice)
-async def voice_handler(message: Message):
-    update_last_active(message.chat.id)
-    file_path = f"temp_{message.chat.id}.ogg"
-    await bot.download(message.voice, destination=file_path)
-    await message.answer("🎙️ Transcribing...")
-    text = await transcribe_audio(file_path)
-    if os.path.exists(file_path): os.remove(file_path)
-    
-    if text.startswith("Error") or text.startswith("STT"):
-        await message.answer(text)
-        return
-        
-    await message.answer(f"📝 **You said:** {text}")
-    
-    state = user_states.get(message.chat.id)
-    if state == "new_task":
-        user_states.pop(message.chat.id, None)
-        await process_new_task(message, text)
-    elif state == "web_search":
-        user_states.pop(message.chat.id, None)
-        await process_web_search(message, text)
-    elif state == "gen_image":
-        user_states.pop(message.chat.id, None)
-        await process_gen_image(message, text)
-    elif state == "dl_music":
-        user_states.pop(message.chat.id, None)
-        await process_download_music(message, text)
-    elif state == "dl_video":
-        user_states.pop(message.chat.id, None)
-        await process_download_video(message, text)
-    else:
-        await process_new_task(message, text)
-
 @dp.message(F.video)
 async def video_handler(message: Message):
-    update_last_active(message.chat.id)
-    
+    chat_id = message.chat.id
+    update_last_active(chat_id)
+
+    # Check if user is in Promo Mode
+    if user_states.get(chat_id) == "promo_link":
+        user_states.pop(chat_id, None)
+        if message.video.file_size and message.video.file_size > 20 * 1024 * 1024:
+            await message.answer("❌ Promo video is too large (Max 20MB).", reply_markup=get_main_keyboard())
+            return
+        caption = message.caption or "Check this out!"
+        file_id = message.video.file_id
+        db_execute("INSERT INTO promos (user_id, media_type, file_id, caption, created_at) VALUES (?, ?, ?, ?, ?)", 
+                   (chat_id, "video", file_id, caption, datetime.now(timezone.utc).isoformat()))
+        await message.answer("✅ **Content received!** Broadcasting to the network now...", reply_markup=get_main_keyboard())
+        await broadcast_promo(message, "video", file_id, caption)
+        return
+
+    # Normal Video Analysis
     if message.video.file_size and message.video.file_size > 20 * 1024 * 1024:
         await message.answer("❌ Video is too large! Telegram limits bots to downloading 20MB files directly.", reply_markup=get_main_keyboard())
         return
 
-    file_path = f"vid_{message.chat.id}.mp4"
-    audio_path = f"aud_{message.chat.id}.mp3"
+    file_path = f"vid_{chat_id}.mp4"
+    audio_path = f"aud_{chat_id}.mp3"
     
     await message.answer("🎬 Downloading video...")
     try:
@@ -368,6 +386,40 @@ async def video_handler(message: Message):
         if os.path.exists(file_path): os.remove(file_path)
         if os.path.exists(audio_path): os.remove(audio_path)
 
+@dp.message(F.voice)
+async def voice_handler(message: Message):
+    update_last_active(message.chat.id)
+    file_path = f"temp_{message.chat.id}.ogg"
+    await bot.download(message.voice, destination=file_path)
+    await message.answer("🎙️ Transcribing...")
+    text = await transcribe_audio(file_path)
+    if os.path.exists(file_path): os.remove(file_path)
+    
+    if text.startswith("Error") or text.startswith("STT"):
+        await message.answer(text)
+        return
+        
+    await message.answer(f"📝 **You said:** {text}")
+    
+    state = user_states.get(message.chat.id)
+    if state == "new_task":
+        user_states.pop(message.chat.id, None)
+        await process_new_task(message, text)
+    elif state == "web_search":
+        user_states.pop(message.chat.id, None)
+        await process_web_search(message, text)
+    elif state == "gen_image":
+        user_states.pop(message.chat.id, None)
+        await process_gen_image(message, text)
+    elif state == "dl_music":
+        user_states.pop(message.chat.id, None)
+        await process_download_music(message, text)
+    elif state == "dl_video":
+        user_states.pop(message.chat.id, None)
+        await process_download_video(message, text)
+    else:
+        await process_new_task(message, text)
+
 @dp.message(F.text)
 async def text_router(message: Message):
     chat_id = message.chat.id
@@ -379,40 +431,35 @@ async def text_router(message: Message):
     text = message.text
     state = user_states.get(chat_id)
 
+    # --- BUTTONS ---
     if text == "📍 Share Location":
         await message.answer("Tap 📎 -> Location.", reply_markup=get_main_keyboard())
-        return
     elif text == "🆔 My Chat ID":
         await message.answer(f"Your ID: `{chat_id}`", reply_markup=get_main_keyboard())
-        return
     elif text == "🔍 Find Place":
         user_states[chat_id] = "find"
         await message.answer("🔍 Type the place (e.g., 'hospital'):")
-        return
     elif text == "🌤️ Weather":
         row = db_fetch("SELECT lat, lon FROM user_locations WHERE chat_id = ?", (chat_id,))
         if not row: await message.answer("⚠️ Share location first!", reply_markup=get_main_keyboard())
         else: await message.answer(await get_weather(row[0], row[1]), reply_markup=get_main_keyboard())
-        return
     elif text == "🌐 Web Search":
         user_states[chat_id] = "web_search"
         await message.answer("🌐 What do you want to search?")
-        return
     elif text == "🎨 Gen Image":
         user_states[chat_id] = "gen_image"
         await message.answer("🎨 Describe the image:")
-        return
     elif text == "🎬 Analyze Video":
         await message.answer("🎬 Please send/forward a short video file (under 20MB) for me to analyze.")
-        return
     elif text == "📥 Download Video":
         user_states[chat_id] = "dl_video"
         await message.answer("📥 Send me a link to a YouTube, TikTok, or Instagram video:")
-        return
     elif text == "🎵 Download Music":
         user_states[chat_id] = "dl_music"
         await message.answer("🎵 Send me a song name or a YouTube link:")
-        return
+    elif text == "🚀 Promote Content":
+        user_states[chat_id] = "promo_link"
+        await message.answer("🚀 **Viral Promoter Engine**\n\nSend me a YouTube/TikTok link, OR send a photo/video with a caption to broadcast to all users!", reply_markup=get_main_keyboard())
     elif text == "🗣️ Voice Settings":
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🇺🇸 Aria (US Female)", callback_data="voice_en-US-AriaNeural")],
@@ -421,49 +468,39 @@ async def text_router(message: Message):
             [InlineKeyboardButton(text="🇦🇺 Natasha (AU Female)", callback_data="voice_en-AU-NatashaNeural")]
         ])
         await message.answer("🗣️ Choose a voice for receipts:", reply_markup=kb)
-        return
     elif text == "🧠 New Task":
         user_states[chat_id] = "new_task"
         await message.answer("🧠 Type the goal:")
-        return
     elif text == "🔄 Inject Plan":
         user_states[chat_id] = "inject"
         await message.answer("🔄 Type the new instruction:")
-        return
     elif text == "👥 Add Contact":
         user_states[chat_id] = "add_contact"
         await message.answer("👥 Type: `12345678 John`")
-        return
     elif text == "📇 My Contacts":
         contacts = db_fetchall("SELECT contact_id, name FROM contacts WHERE owner_id = ?", (chat_id,))
         if not contacts: 
             await message.answer("No contacts. Tap 👥 Add Contact.", reply_markup=get_main_keyboard())
-            return
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"{c[1]} ({get_online_status(c[0])})", callback_data=f"contact_{c[0]}")] for c in contacts])
-        await message.answer("📇 **Contacts:**", reply_markup=kb)
-        return
+        else:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"{c[1]} ({get_online_status(c[0])})", callback_data=f"contact_{c[0]}")] for c in contacts])
+            await message.answer("📇 **Contacts:**", reply_markup=kb)
     elif text == "💬 Send Message":
         user_states[chat_id] = "msg"
         last = db_fetch("SELECT last_contact FROM users WHERE chat_id = ?", (chat_id,))[0]
         if last: await message.answer(f"💬 Chatting with `{last}`.\nType reply:")
         else: await message.answer("💬 No active chat. Use 📇 My Contacts.")
-        return
     elif text == "⏰ Schedule Relay":
         user_states[chat_id] = "relay"
         await message.answer("⏰ Type: `12345678 14:30 Message`")
-        return
     elif text == "✅ Finish Task":
         await process_done(message)
-        return
     elif text == "📋 Status":
         tasks = db_fetchall("SELECT id, goal, status FROM tasks WHERE chat_id = ? ORDER BY id DESC LIMIT 5", (chat_id,))
-        if not tasks: 
-            await message.answer("No tasks.", reply_markup=get_main_keyboard())
-            return
-        await message.answer("📋 **Recent Tasks**\n\n" + "\n".join([f"#{t[0]} [{t[2]}] — {t[1][:30]}..." for t in tasks]), reply_markup=get_main_keyboard())
-        return
+        if not tasks: await message.answer("No tasks.", reply_markup=get_main_keyboard())
+        else: await message.answer("📋 **Recent Tasks**\n\n" + "\n".join([f"#{t[0]} [{t[2]}] — {t[1][:30]}..." for t in tasks]), reply_markup=get_main_keyboard())
 
-    if state == "new_task":
+    # --- USER INPUTS BASED ON STATE ---
+    elif state == "new_task":
         user_states.pop(chat_id, None)
         await process_new_task(message, text)
     elif state == "find":
@@ -487,6 +524,12 @@ async def text_router(message: Message):
     elif state == "dl_music":
         user_states.pop(chat_id, None)
         await process_download_music(message, text)
+    elif state == "promo_link" and text.startswith("http"):
+        user_states.pop(chat_id, None)
+        db_execute("INSERT INTO promos (user_id, link, caption, created_at) VALUES (?, ?, ?, ?)", 
+                   (chat_id, text, "Check out this link!", datetime.now(timezone.utc).isoformat()))
+        await message.answer("✅ **Link received!** Broadcasting to the network now...", reply_markup=get_main_keyboard())
+        await broadcast_promo(message, "link", text, "Check out this link!")
     elif state == "add_contact":
         user_states.pop(chat_id, None)
         parts = text.split(maxsplit=1)
@@ -516,11 +559,34 @@ async def text_router(message: Message):
             await message.answer(f"✅ Scheduled for {time_str} UTC.", reply_markup=get_main_keyboard())
         except: await message.answer("❌ Format: `12345678 14:30 Message`", reply_markup=get_main_keyboard())
     else:
-        # THIS IS THE FIX FOR TYPING WITHOUT PRESSING NEW TASK
+        # Fallback: treat any unknown text as a New Task
         await process_new_task(message, text)
 
 # ==========================================
-# 5. PROCESSES
+# 5. PROMOTER BROADCAST LOGIC
+# ==========================================
+async def broadcast_promo(message: Message, media_type: str, file_id: str, caption: str):
+    users = db_fetchall("SELECT chat_id FROM users WHERE is_verified = 1")
+    count = 0
+    promo_msg = f"🔥 **PROMOTED CONTENT** 🔥\n\n{caption}\n\n_Submitted by User {message.chat.id}_"
+    
+    for (uid,) in users:
+        if uid == message.chat.id: continue
+        try:
+            if media_type == "photo":
+                await bot.send_photo(uid, photo=file_id, caption=promo_msg)
+            elif media_type == "video":
+                await bot.send_video(uid, video=file_id, caption=promo_msg)
+            else:
+                await bot.send_message(uid, f"{promo_msg}\n{file_id}", disable_web_page_preview=False)
+            count += 1
+            await asyncio.sleep(0.05) # Prevent Telegram rate limits
+        except: pass 
+        
+    await message.answer(f"📢 **Promotion Complete!** Your content was broadcasted to {count} users.")
+
+# ==========================================
+# 6. PROCESSES
 # ==========================================
 async def process_new_task(message: Message, goal: str):
     chat_id = message.chat.id
@@ -678,7 +744,7 @@ async def error_handler(event: any):
         logging.error(f"Failed to handle error: {e}")
 
 # ==========================================
-# 6. MAIN
+# 7. MAIN
 # ==========================================
 async def main():
     init_db()
