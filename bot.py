@@ -14,6 +14,7 @@ from pypdf import PdfReader
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
+from aiogram.enums import ChatType
 from aiogram.types import (
     Message, FSInputFile, ReplyKeyboardMarkup, KeyboardButton, 
     InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
@@ -49,7 +50,8 @@ def get_main_keyboard():
         [KeyboardButton(text="📥 Download Video"), KeyboardButton(text="🎵 Download Music")],
         [KeyboardButton(text="💬 Send Message"), KeyboardButton(text="📇 My Contacts")],
         [KeyboardButton(text="👥 Add Contact"), KeyboardButton(text="🚀 Promote Content")],
-        [KeyboardButton(text="🗣️ Voice Settings"), KeyboardButton(text="🆔 My Chat ID")]
+        [KeyboardButton(text="⏰ Set Briefing"), KeyboardButton(text="🗣️ Voice Settings")],
+        [KeyboardButton(text="🆔 My Chat ID")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
@@ -64,12 +66,15 @@ def init_db():
     c.execute("CREATE TABLE IF NOT EXISTS relays (id INTEGER PRIMARY KEY AUTOINCREMENT, target_chat_id INTEGER, message TEXT, send_at TEXT, sent BOOLEAN DEFAULT 0)")
     c.execute("CREATE TABLE IF NOT EXISTS user_locations (chat_id INTEGER PRIMARY KEY, lat REAL, lon REAL)")
     c.execute("CREATE TABLE IF NOT EXISTS contacts (owner_id INTEGER, contact_id INTEGER, name TEXT, UNIQUE(owner_id, contact_id))")
-    c.execute("CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY, is_verified BOOLEAN DEFAULT 0, last_contact INTEGER, last_active TEXT, voice_persona TEXT DEFAULT 'en-US-AriaNeural', referred_by INTEGER)")
+    c.execute("CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY, is_verified BOOLEAN DEFAULT 0, last_contact INTEGER, last_active TEXT, voice_persona TEXT DEFAULT 'en-US-AriaNeural', referred_by INTEGER, briefing_time TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS promos (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, media_type TEXT, file_id TEXT, caption TEXT, link TEXT, views INTEGER DEFAULT 0, created_at TEXT)")
     
+    # Migrations
     try: c.execute("ALTER TABLE users ADD COLUMN voice_persona TEXT DEFAULT 'en-US-AriaNeural'")
     except sqlite3.OperationalError: pass
     try: c.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
+    except sqlite3.OperationalError: pass
+    try: c.execute("ALTER TABLE users ADD COLUMN briefing_time TEXT")
     except sqlite3.OperationalError: pass
         
     conn.commit()
@@ -126,8 +131,30 @@ async def check_scheduled_relays():
     conn.commit()
     conn.close()
 
+async def check_daily_briefings():
+    now_utc = datetime.now(timezone.utc).strftime("%H:%M")
+    users = db_fetchall("SELECT chat_id FROM users WHERE briefing_time = ?", (now_utc,))
+    
+    for (chat_id,) in users:
+        try:
+            # Get Weather
+            loc = db_fetch("SELECT lat, lon FROM user_locations WHERE chat_id = ?", (chat_id,))
+            weather = await get_weather(loc[0], loc[1]) if loc else "🌤️ Weather: Set your location to get daily weather."
+            
+            # Get Active Tasks
+            tasks = db_fetchall("SELECT goal FROM tasks WHERE chat_id = ? AND status = 'active'", (chat_id,))
+            task_list = "\n".join([f"• {t[0]}" for t in tasks]) if tasks else "No active tasks."
+            
+            # Get Quote
+            quote = await ask_ai("Generate a short, 1-sentence motivational quote for the morning.")
+            
+            briefing = f"☀️ **Good Morning! Here is your Daily Briefing:**\n\n{weather}\n\n📋 **Your Active Tasks:**\n{task_list}\n\n💡 **Daily Motivation:**\n_{quote}_"
+            await bot.send_message(chat_id, briefing)
+        except Exception as e:
+            logging.error(f"Briefing failed for {chat_id}: {e}")
+
 # ==========================================
-# 3. HELPER FUNCTIONS (AI, Voice, Maps)
+# 3. HELPER FUNCTIONS
 # ==========================================
 async def ask_ai(prompt: str) -> str:
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -233,7 +260,7 @@ async def start_handler(message: Message):
     chat_id = message.chat.id
     update_last_active(chat_id)
     
-    # REFERRAL TRACKING
+    # Referral tracking
     args = message.text.split()
     if len(args) > 1 and args[1].startswith("ref_"):
         referrer_id = int(args[1].replace("ref_", ""))
@@ -250,9 +277,8 @@ async def start_handler(message: Message):
         bot_info = await bot.get_me()
         ref_link = f"https://t.me/{bot_info.username}?start=ref_{chat_id}"
         await message.answer(
-            f"🤖 **ChronoSwarm v9.0**\nWelcome back!\n\n"
-            f"🔗 **Your Invite Link:**\n`{ref_link}`\n"
-            f"Share this to grow the network!", 
+            f"🤖 **ChronoSwarm v10.0**\nWelcome back!\n\n"
+            f"🔗 **Your Invite Link:**\n`{ref_link}`", 
             reply_markup=get_main_keyboard()
         )
     else:
@@ -304,26 +330,23 @@ async def document_handler(message: Message):
     await message.answer("📄 Downloading and reading PDF...")
     try:
         await bot.download(message.document, destination=file_path)
-        
         reader = PdfReader(file_path)
         text = ""
         for page in reader.pages[:10]:
             text += page.extract_text() or ""
 
         if not text.strip():
-            await message.answer("❌ Could not extract text from this PDF. It might be a scanned image or empty.", reply_markup=get_main_keyboard())
+            await message.answer("❌ Could not extract text from this PDF.", reply_markup=get_main_keyboard())
             return
 
-        await message.answer("🧠 Analyzing document with AI (this may take a moment)...")
-        prompt = f"Here is the text from a PDF document:\n\n{text[:10000]}\n\nPlease summarize this document and highlight the key points."
+        await message.answer("🧠 Analyzing document with AI...")
+        prompt = f"Here is the text from a PDF:\n\n{text[:10000]}\n\nPlease summarize this document and highlight key points."
         summary = await ask_ai(prompt)
         await message.answer(f"📄 **PDF Analysis:**\n\n{summary}", reply_markup=get_main_keyboard())
-        
     except Exception as e:
         await message.answer(f"❌ Error reading PDF: {str(e)[:100]}", reply_markup=get_main_keyboard())
     finally:
-        if os.path.exists(file_path): 
-            os.remove(file_path)
+        if os.path.exists(file_path): os.remove(file_path)
 
 @dp.message(F.photo)
 async def photo_handler(message: Message):
@@ -367,7 +390,7 @@ async def video_handler(message: Message):
         return
 
     if message.video.file_size and message.video.file_size > 20 * 1024 * 1024:
-        await message.answer("❌ Video is too large! Telegram limits bots to downloading 20MB files directly.", reply_markup=get_main_keyboard())
+        await message.answer("❌ Video is too large! Max 20MB.", reply_markup=get_main_keyboard())
         return
 
     file_path = f"vid_{chat_id}.mp4"
@@ -380,13 +403,11 @@ async def video_handler(message: Message):
         await message.answer(f"❌ Failed to download video: {e}", reply_markup=get_main_keyboard())
         return
     
-    await message.answer("🎵 Extracting audio and transcribing (this may take a moment)...")
-    
+    await message.answer("🎵 Extracting audio and transcribing...")
     try:
         process = await asyncio.create_subprocess_exec(
             'ffmpeg', '-i', file_path, '-vn', '-acodec', 'libmp3lame', '-q:a', '4', audio_path, '-y',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         await process.communicate()
 
@@ -395,7 +416,7 @@ async def video_handler(message: Message):
             return
 
         if os.path.getsize(audio_path) > 24 * 1024 * 1024:
-            await message.answer("❌ Audio track is too large for AI transcription (over 24MB). Try a shorter video.")
+            await message.answer("❌ Audio track too large (over 24MB).")
             return
 
         transcript = await transcribe_audio(audio_path)
@@ -404,12 +425,11 @@ async def video_handler(message: Message):
             return
 
         await message.answer("🧠 Audio transcribed! Generating summary...")
-        prompt = f"Here is the transcript of a video: '{transcript}'. Please provide a concise summary of what happens in this video."
+        prompt = f"Here is the transcript of a video: '{transcript}'. Provide a concise summary."
         summary = await ask_ai(prompt)
 
         response_text = f"**📝 Transcript (First 500 chars):**\n_{transcript[:500]}..._\n\n**🧠 AI Summary:**\n{summary}"
         await message.answer(response_text, reply_markup=get_main_keyboard())
-
     except Exception as e:
         await message.answer(f"❌ Video processing failed: {e}", reply_markup=get_main_keyboard())
     finally:
@@ -430,7 +450,6 @@ async def voice_handler(message: Message):
         return
         
     await message.answer(f"📝 **You said:** {text}")
-    
     state = user_states.get(message.chat.id)
     if state == "new_task":
         user_states.pop(message.chat.id, None)
@@ -454,11 +473,27 @@ async def voice_handler(message: Message):
 async def text_router(message: Message):
     chat_id = message.chat.id
     update_last_active(chat_id)
+    text = message.text
+    
+    # --- GROUP CHAT HANDLING ---
+    if message.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        bot_info = await bot.get_me()
+        if f"@{bot_info.username}" in text:
+            # Strip the mention and process as an AI query
+            clean_text = text.replace(f"@{bot_info.username}", "").strip()
+            if clean_text:
+                await message.reply("🧠 Thinking...")
+                response = await ask_ai(clean_text)
+                await message.reply(response)
+            return
+        else:
+            return # Ignore other group messages
+
+    # --- PRIVATE CHAT HANDLING ---
     if not db_fetch("SELECT is_verified FROM users WHERE chat_id = ?", (chat_id,))[0]:
         await message.answer("🛡️ Please verify first.")
         return
 
-    text = message.text
     state = user_states.get(chat_id)
 
     # --- BUTTONS ---
@@ -480,7 +515,7 @@ async def text_router(message: Message):
         user_states[chat_id] = "gen_image"
         await message.answer("🎨 Describe the image:")
     elif text == "🎬 Analyze Video":
-        await message.answer("🎬 Please send/forward a short video file (under 20MB) for me to analyze.")
+        await message.answer("🎬 Please send/forward a short video file (under 20MB).")
     elif text == "📄 Analyze PDF":
         await message.answer("📄 Please send me a PDF document to analyze.")
     elif text == "📥 Download Video":
@@ -492,6 +527,9 @@ async def text_router(message: Message):
     elif text == "🚀 Promote Content":
         user_states[chat_id] = "promo_link"
         await message.answer("🚀 **Viral Promoter Engine**\n\nSend me a YouTube/TikTok link, OR send a photo/video with a caption to broadcast to all users!", reply_markup=get_main_keyboard())
+    elif text == "⏰ Set Briefing":
+        user_states[chat_id] = "set_briefing"
+        await message.answer("⏰ What time do you want your daily briefing? (Format: `HH:MM` in UTC)\nExample: `08:00`")
     elif text == "🗣️ Voice Settings":
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🇺🇸 Aria (US Female)", callback_data="voice_en-US-AriaNeural")],
@@ -511,8 +549,7 @@ async def text_router(message: Message):
         await message.answer("👥 Type: `12345678 John`")
     elif text == "📇 My Contacts":
         contacts = db_fetchall("SELECT contact_id, name FROM contacts WHERE owner_id = ?", (chat_id,))
-        if not contacts: 
-            await message.answer("No contacts. Tap 👥 Add Contact.", reply_markup=get_main_keyboard())
+        if not contacts: await message.answer("No contacts. Tap 👥 Add Contact.", reply_markup=get_main_keyboard())
         else:
             kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"{c[1]} ({get_online_status(c[0])})", callback_data=f"contact_{c[0]}")] for c in contacts])
             await message.answer("📇 **Contacts:**", reply_markup=kb)
@@ -560,8 +597,17 @@ async def text_router(message: Message):
         user_states.pop(chat_id, None)
         db_execute("INSERT INTO promos (user_id, link, caption, created_at) VALUES (?, ?, ?, ?)", 
                    (chat_id, text, "Check out this link!", datetime.now(timezone.utc).isoformat()))
-        await message.answer("✅ **Link received!** Broadcasting to the network now...", reply_markup=get_main_keyboard())
+        await message.answer("✅ **Link received!** Broadcasting...", reply_markup=get_main_keyboard())
         await broadcast_promo(message, "link", text, "Check out this link!")
+    elif state == "set_briefing":
+        user_states.pop(chat_id, None)
+        try:
+            # Validate HH:MM format
+            datetime.strptime(text, "%H:%M")
+            db_execute("UPDATE users SET briefing_time = ? WHERE chat_id = ?", (text, chat_id))
+            await message.answer(f"✅ Daily briefing scheduled for `{text}` UTC every day!", reply_markup=get_main_keyboard())
+        except ValueError:
+            await message.answer("❌ Invalid format. Please use `HH:MM` (e.g., `08:00`).", reply_markup=get_main_keyboard())
     elif state == "add_contact":
         user_states.pop(chat_id, None)
         parts = text.split(maxsplit=1)
@@ -594,7 +640,7 @@ async def text_router(message: Message):
         await process_new_task(message, text)
 
 # ==========================================
-# 5. PROMOTER BROADCAST LOGIC
+# 5. PROMOTER & PROCESSES
 # ==========================================
 async def broadcast_promo(message: Message, media_type: str, file_id: str, caption: str):
     users = db_fetchall("SELECT chat_id FROM users WHERE is_verified = 1")
@@ -604,21 +650,14 @@ async def broadcast_promo(message: Message, media_type: str, file_id: str, capti
     for (uid,) in users:
         if uid == message.chat.id: continue
         try:
-            if media_type == "photo":
-                await bot.send_photo(uid, photo=file_id, caption=promo_msg)
-            elif media_type == "video":
-                await bot.send_video(uid, video=file_id, caption=promo_msg)
-            else:
-                await bot.send_message(uid, f"{promo_msg}\n{file_id}", disable_web_page_preview=False)
+            if media_type == "photo": await bot.send_photo(uid, photo=file_id, caption=promo_msg)
+            elif media_type == "video": await bot.send_video(uid, video=file_id, caption=promo_msg)
+            else: await bot.send_message(uid, f"{promo_msg}\n{file_id}", disable_web_page_preview=False)
             count += 1
             await asyncio.sleep(0.05) 
         except: pass 
-        
     await message.answer(f"📢 **Promotion Complete!** Your content was broadcasted to {count} users.")
 
-# ==========================================
-# 6. PROCESSES
-# ==========================================
 async def process_new_task(message: Message, goal: str):
     chat_id = message.chat.id
     conn = sqlite3.connect(DB_PATH)
@@ -634,32 +673,24 @@ async def process_web_search(message: Message, query: str):
     await message.answer("🌐 Searching the web...", reply_markup=get_main_keyboard())
     try:
         url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=15) as resp:
-                if resp.status != 200:
-                    await message.answer("❌ Search failed. Try again.", reply_markup=get_main_keyboard())
-                    return
-                html = await resp.text()
-                soup = BeautifulSoup(html, "html.parser")
+                if resp.status != 200: return await message.answer("❌ Search failed.", reply_markup=get_main_keyboard())
+                soup = BeautifulSoup(await resp.text(), "html.parser")
                 results = []
                 for result in soup.find_all("div", class_="result")[:3]:
                     title_tag = result.find("a", class_="result__a")
                     snippet_tag = result.find("a", class_="result__snippet")
                     if title_tag:
                         results.append(f"• **{title_tag.get_text()}**\n{snippet_tag.get_text() if snippet_tag else ''}\n[Read More]({title_tag.get('href')})\n")
-                if not results:
-                    await message.answer("❌ No results found.", reply_markup=get_main_keyboard())
-                else:
-                    await message.answer("🌐 **Search Results:**\n\n" + "\n".join(results), disable_web_page_preview=True, reply_markup=get_main_keyboard())
-    except Exception as e:
-        await message.answer(f"❌ Search error: {e}", reply_markup=get_main_keyboard())
+                if not results: await message.answer("❌ No results found.", reply_markup=get_main_keyboard())
+                else: await message.answer("🌐 **Search Results:**\n\n" + "\n".join(results), disable_web_page_preview=True, reply_markup=get_main_keyboard())
+    except Exception as e: await message.answer(f"❌ Search error: {e}", reply_markup=get_main_keyboard())
 
 async def process_gen_image(message: Message, prompt: str):
     await message.answer("🎨 Generating image...", reply_markup=get_main_keyboard())
     resolutions = [(1024, 1024), (768, 768)]
-    
     for attempt, (width, height) in enumerate(resolutions):
         url = f"https://image.pollinations.ai/prompt/{prompt.replace(' ', '%20')}?width={width}&height={height}&nologo=true"
         try:
@@ -669,73 +700,38 @@ async def process_gen_image(message: Message, prompt: str):
                         img_bytes = await resp.read()
                         await message.answer_photo(BufferedInputFile(img_bytes, filename="image.jpg"), caption=f"🎨 {prompt}", reply_markup=get_main_keyboard())
                         return
-        except Exception as e:
-            logging.warning(f"Image gen attempt {attempt+1} error: {e}")
+        except: pass
         if attempt < len(resolutions) - 1: await asyncio.sleep(2)
-            
-    await message.answer("❌ Image generation failed (server overloaded). Try a simpler prompt.", reply_markup=get_main_keyboard())
+    await message.answer("❌ Image generation failed (server overloaded).", reply_markup=get_main_keyboard())
 
 async def process_download_video(message: Message, url: str):
-    await message.answer("📥 Downloading video... Please wait.", reply_markup=get_main_keyboard())
+    await message.answer("📥 Downloading video...", reply_markup=get_main_keyboard())
     outtmpl = f"dl_{message.chat.id}_%(id)s.%(ext)s"
-    
-    ydl_opts = {
-        'format': 'best[ext=mp4]/best',
-        'outtmpl': outtmpl,
-        'quiet': True,
-        'noplaylist': True,
-        'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'mweb']}},
-    }
-    
-    def download():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url, download=True)
-
+    ydl_opts = {'format': 'best[ext=mp4]/best', 'outtmpl': outtmpl, 'quiet': True, 'noplaylist': True, 'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'mweb']}}}
+    def download(): 
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl: return ydl.extract_info(url, download=True)
     try:
         info = await asyncio.to_thread(download)
         filename = info['requested_downloads'][0]['filepath']
-        
-        if os.path.getsize(filename) > 50 * 1024 * 1024:
-            await message.answer("❌ Video is too large to send via Telegram (Limit is 50MB).", reply_markup=get_main_keyboard())
-        else:
-            await message.answer_video(FSInputFile(filename), caption="📥 Here is your video!", reply_markup=get_main_keyboard())
-    except Exception as e:
-        await message.answer(f"❌ Download failed. Make sure the URL is valid and public.\nError: {str(e)[:100]}", reply_markup=get_main_keyboard())
+        if os.path.getsize(filename) > 50 * 1024 * 1024: await message.answer("❌ Video too large (Max 50MB).", reply_markup=get_main_keyboard())
+        else: await message.answer_video(FSInputFile(filename), caption="📥 Here is your video!", reply_markup=get_main_keyboard())
+    except Exception as e: await message.answer(f"❌ Download failed: {str(e)[:100]}", reply_markup=get_main_keyboard())
     finally:
         for f in glob.glob(f"dl_{message.chat.id}_*"):
             try: os.remove(f)
             except: pass
 
 async def process_download_music(message: Message, query: str):
-    await message.answer("🎵 Searching and downloading music...", reply_markup=get_main_keyboard())
+    await message.answer("🎵 Downloading music...", reply_markup=get_main_keyboard())
     outtmpl = f"mus_{message.chat.id}_%(id)s.%(ext)s"
-    
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': outtmpl,
-        'quiet': True,
-        'noplaylist': True,
-        'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'mweb']}},
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-    }
-    
-    def download():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            search_q = query if query.startswith("http") else f"ytsearch1:{query}"
-            return ydl.extract_info(search_q, download=True)
-
+    ydl_opts = {'format': 'bestaudio/best', 'outtmpl': outtmpl, 'quiet': True, 'noplaylist': True, 'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'mweb']}}, 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]}
+    def download(): 
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl: return ydl.extract_info(query if query.startswith("http") else f"ytsearch1:{query}", download=True)
     try:
         info = await asyncio.to_thread(download)
-        base_name = info['requested_downloads'][0]['filepath'].rsplit('.', 1)[0]
-        filename = f"{base_name}.mp3"
-        
+        filename = f"{info['requested_downloads'][0]['filepath'].rsplit('.', 1)[0]}.mp3"
         await message.answer_audio(FSInputFile(filename), title=info.get('title', query), reply_markup=get_main_keyboard())
-    except Exception as e:
-        await message.answer(f"❌ Music download failed: {str(e)[:100]}", reply_markup=get_main_keyboard())
+    except Exception as e: await message.answer(f"❌ Music failed: {str(e)[:100]}", reply_markup=get_main_keyboard())
     finally:
         for f in glob.glob(f"mus_{message.chat.id}_*"):
             try: os.remove(f)
@@ -743,43 +739,30 @@ async def process_download_music(message: Message, query: str):
 
 async def process_done(message: Message):
     row = db_fetch("SELECT id, goal FROM tasks WHERE chat_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1", (message.chat.id,))
-    if not row: 
-        await message.answer("❌ No active task.", reply_markup=get_main_keyboard())
-        return
-    
+    if not row: return await message.answer("❌ No active task.", reply_markup=get_main_keyboard())
     task_id, goal = row
     await message.answer("[Summarizer] Finishing...", reply_markup=get_main_keyboard())
     summary = await ask_ai(f"Summarize this task in 2 sentences: {goal}")
     db_execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
-    
     await message.answer(f"✅ **Task #{task_id} Completed**\n\n{summary}")
-    
     voice_row = db_fetch("SELECT voice_persona FROM users WHERE chat_id = ?", (message.chat.id,))
-    voice = voice_row[0] if voice_row else "en-US-AriaNeural"
-    
-    if (voice_file := await generate_voice(summary, voice)):
+    if (voice_file := await generate_voice(summary, voice_row[0] if voice_row else "en-US-AriaNeural")):
         await message.answer_voice(FSInputFile(voice_file), caption="🔊 Receipt")
         os.remove(voice_file)
 
 # ==========================================
-# GLOBAL ERROR HANDLER
+# GLOBAL ERROR HANDLER & MAIN
 # ==========================================
 @dp.errors()
 async def error_handler(event: any):
     try:
-        update = event.update
-        logging.error(f"Exception while handling update: {update}")
-        if update.message:
-            await update.message.answer("⚠️ An unexpected error occurred. Please try again.")
-    except Exception as e:
-        logging.error(f"Failed to handle error: {e}")
+        if event.update.message: await event.update.message.answer("⚠️ An error occurred. Try again.")
+    except: pass
 
-# ==========================================
-# 7. MAIN
-# ==========================================
 async def main():
     init_db()
     scheduler.add_job(check_scheduled_relays, 'interval', seconds=30) 
+    scheduler.add_job(check_daily_briefings, 'interval', minutes=1) # NEW: Briefing checker
     scheduler.start()
     
     bot_task = asyncio.create_task(dp.start_polling(bot))
